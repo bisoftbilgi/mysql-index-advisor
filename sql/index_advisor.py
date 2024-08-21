@@ -70,12 +70,5 @@ def index_advisor(sql_query, database_ip, database_port, database_name, username
     cursor.close()
     conn.close()
 
-sql_query= input("SQL Query:")
-database_ip = input("Database ip: ")
-database_port= input("Database port: ")
-database_name= input("Database name: ")
-username= input("Username: ")
-password= input("Password: ")
 
-index_advisor(sql_query, database_ip, database_port,database_name, username, password )
 
