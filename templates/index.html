@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MySQL Tuning Wizard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h1>MySQL Tuning Wizard</h1>
+      <p class="sub">Paste a query, look at the plan, get index / stats tips. Indexes are not created unless you pick one below.</p>
+    </div>
+
+    {% if msg %}
+      <div class="banner {% if msg_ok %}ok{% else %}bad{% endif %}">{{ msg }}</div>
+    {% endif %}
+
+    <form method="post" id="mainform">
+      <fieldset>
+        <legend>Connection</legend>
+        <table class="form">
+          <tr>
+            <td>Host</td>
+            <td><input type="text" name="host" value="{{ conn.host }}"></td>
+            <td>Port</td>
+            <td><input type="text" name="port" value="{{ conn.port }}" class="short"></td>
+          </tr>
+          <tr>
+            <td>User</td>
+            <td><input type="text" name="user" value="{{ conn.user }}"></td>
+            <td>Password</td>
+            <td><input type="password" name="password" value="{{ conn.password }}"></td>
+          </tr>
+          <tr>
+            <td>Database</td>
+            <td colspan="3"><input type="text" name="database" value="{{ conn.database }}"></td>
+          </tr>
+        </table>
+        <p class="hint">Default demo schema is <code>tuning_demo</code> (see seed_demo.py). Sakila works too if you have it.</p>
+        <button type="submit" name="action" value="test">Test connection</button>
+      </fieldset>
+
+      <fieldset>
+        <legend>Query</legend>
+        <p>
+          Sample:
+          <select id="samplebox">
+            <option value="">-- pick one --</option>
+            {% for title, q in samples %}
+              <option value="{{ q }}">{{ title }}</option>
+            {% endfor %}
+          </select>
+        </p>
+        <textarea name="query" id="querybox" rows="9" placeholder="SELECT ...">{{ query }}</textarea>
+        <p>
+          <label>
+            <input type="checkbox" name="analyze_too" value="1" {% if analyze_too %}checked{% endif %}>
+            Also run EXPLAIN ANALYZE (this actually executes the query)
+          </label>
+        </p>
+        <button type="submit" name="action" value="analyze" class="primary">Analyze query</button>
+      </fieldset>
+    </form>
+
+    {% if explain and not explain.error %}
+      <fieldset>
+        <legend>Execution plan</legend>
+        {% if issues %}
+          <ul class="issues">
+            {% for i in issues %}
+              <li class="{{ i.level }}">{{ i.text }}</li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p>No obvious red flags from the tabular EXPLAIN (still check the rows below).</p>
+        {% endif %}
+
+        {% if explain.rows %}
+          <div class="tablewrap">
+            <table class="grid">
+              <tr>
+                {% for c in explain.columns %}
+                  <th>{{ c }}</th>
+                {% endfor %}
+              </tr>
+              {% for row in explain.rows %}
+                <tr>
+                  {% for c in explain.columns %}
+                    {% if c == 'type' %}
+                      <td class="access-{{ row[c]|string|lower }}">{{ row[c] }}</td>
+                    {% else %}
+                      <td>{{ row[c] }}</td>
+                    {% endif %}
+                  {% endfor %}
+                </tr>
+              {% endfor %}
+            </table>
+          </div>
+          <p class="hint">type=ALL is a full table scan. type=ref/range is usually what you want. key is the index MySQL picked.</p>
+        {% endif %}
+
+        {% if explain.analyze_text %}
+          <h3>EXPLAIN ANALYZE</h3>
+          <pre>{{ explain.analyze_text }}</pre>
+        {% endif %}
+        {% if explain.analyze_error %}
+          <p class="warn">{{ explain.analyze_error }}</p>
+        {% endif %}
+
+        {% if explain.json_text %}
+          <details>
+            <summary>Raw EXPLAIN JSON</summary>
+            <pre>{{ explain.json_text }}</pre>
+          </details>
+        {% endif %}
+      </fieldset>
+
+      <fieldset>
+        <legend>Index recommendations</legend>
+        <p>Suggestions only. Nothing is created until you choose one and confirm.</p>
+        {% if already %}
+          <ul>
+            {% for a in already %}
+              <li>{{ a.note }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+        {% if suggestions %}
+          <form method="post" onsubmit="return confirm('Run this on the real database?\n\n' + this.index_sql.value);">
+            <input type="hidden" name="host" value="{{ conn.host }}">
+            <input type="hidden" name="port" value="{{ conn.port }}">
+            <input type="hidden" name="user" value="{{ conn.user }}">
+            <input type="hidden" name="password" value="{{ conn.password }}">
+            <input type="hidden" name="database" value="{{ conn.database }}">
+            <textarea class="hid" name="query">{{ query }}</textarea>
+            <p>
+              Create index:
+              <select name="index_sql" id="index_sql">
+                {% for s in suggestions %}
+                  <option value="{{ s.sql }}">{{ s.label }} — {{ s.why }}</option>
+                {% endfor %}
+              </select>
+              <button type="submit" name="action" value="create_index">Create selected index</button>
+            </p>
+          </form>
+          <table class="grid">
+            <tr><th>Table</th><th>Columns</th><th>Why</th><th>SQL</th></tr>
+            {% for s in suggestions %}
+              <tr>
+                <td>{{ s.table }}</td>
+                <td>{{ s.columns|join(', ') }}</td>
+                <td>{{ s.why }}</td>
+                <td><code>{{ s.sql }}</code></td>
+              </tr>
+            {% endfor %}
+          </table>
+        {% else %}
+          <p>No extra index suggested for this query (or the useful ones already exist).</p>
+        {% endif %}
+
+        {% if existing_indexes %}
+          <h3>Current indexes</h3>
+          <table class="grid">
+            <tr><th>Table</th><th>Index</th><th>Unique</th><th>Columns</th></tr>
+            {% for table, idxs in existing_indexes.items() %}
+              {% for idx in idxs %}
+                <tr>
+                  <td>{{ table }}</td>
+                  <td>{{ idx.name }}</td>
+                  <td>{{ 'yes' if idx.unique else 'no' }}</td>
+                  <td>{{ idx.columns|join(', ') }}</td>
+                </tr>
+              {% endfor %}
+            {% endfor %}
+          </table>
+        {% endif %}
+      </fieldset>
+
+      <fieldset>
+        <legend>Statistics</legend>
+        {% if stat_notes %}
+          <ul class="issues">
+            {% for n in stat_notes %}
+              <li class="{{ n.level }}">{{ n.text }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+        {% if stats %}
+          <table class="grid">
+            <tr>
+              <th>Table</th>
+              <th>Engine</th>
+              <th>TABLE_ROWS</th>
+              <th>innodb n_rows</th>
+              <th>data</th>
+              <th>index</th>
+              <th>update_time</th>
+              <th>stats last update</th>
+            </tr>
+            {% for s in stats %}
+              <tr>
+                <td>{{ s.table }}</td>
+                <td>{{ s.engine }}</td>
+                <td>{{ s.table_rows }}</td>
+                <td>{{ s.innodb_n_rows if s.innodb_n_rows is not none else '-' }}</td>
+                <td>{{ s.data_length }}</td>
+                <td>{{ s.index_length }}</td>
+                <td>{{ s.update_time or '-' }}</td>
+                <td>{{ s.stats_last_update or '-' }}</td>
+              </tr>
+            {% endfor %}
+          </table>
+          <form method="post">
+            <input type="hidden" name="host" value="{{ conn.host }}">
+            <input type="hidden" name="port" value="{{ conn.port }}">
+            <input type="hidden" name="user" value="{{ conn.user }}">
+            <input type="hidden" name="password" value="{{ conn.password }}">
+            <input type="hidden" name="database" value="{{ conn.database }}">
+            <textarea class="hid" name="query">{{ query }}</textarea>
+            <p>
+              ANALYZE TABLE
+              <select name="stat_table">
+                {% for s in stats %}
+                  <option value="{{ s.table }}">{{ s.table }}</option>
+                {% endfor %}
+              </select>
+              <button type="submit" name="action" value="analyze_table"
+                onclick="return confirm('Run ANALYZE TABLE on ' + this.form.stat_table.value + '?');">
+                Run ANALYZE TABLE
+              </button>
+            </p>
+          </form>
+        {% else %}
+          <p>No table stats (query had no tables I could resolve, or information_schema read failed).</p>
+        {% endif %}
+      </fieldset>
+
+      <fieldset>
+        <legend>Query notes / possible rewrites</legend>
+        {% if tips %}
+          {% for t in tips %}
+            <div class="tip">
+              <strong>{{ t.title }}</strong>
+              <p>{{ t.detail }}</p>
+            </div>
+          {% endfor %}
+        {% else %}
+          <p>No basic anti-patterns matched (SELECT *, YEAR(col), LIKE '%x', ORDER BY RAND(), etc.).</p>
+        {% endif %}
+      </fieldset>
+    {% endif %}
+
+    <p class="foot">Internship project — local use. Do not point this at production unless you mean it; CREATE INDEX and ANALYZE TABLE are real statements.</p>
+  </div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
