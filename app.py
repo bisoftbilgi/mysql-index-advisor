@@ -63,6 +63,7 @@ def empty_state():
         "conn": form_conn(),
         "query": session.get("query", SAMPLE_QUERIES[0][1]),
         "analyze_too": False,
+        "profile_too": False,
         "samples": SAMPLE_QUERIES,
         "msg": None,
         "msg_ok": False,
@@ -72,7 +73,11 @@ def empty_state():
         "already": [],
         "stats": [],
         "stat_notes": [],
+        "histograms": [],
+        "hist_actions": [],
         "tips": [],
+        "hints": [],
+        "profile": None,
         "used": {},
         "existing_indexes": {},
     }
@@ -92,6 +97,7 @@ def index():
     data["conn"] = conn
     data["query"] = query
     data["analyze_too"] = request.form.get("analyze_too") == "1"
+    data["profile_too"] = request.form.get("profile_too") == "1"
 
     if action == "test":
         ok, msg = db_utils.test_connection(conn)
@@ -122,6 +128,17 @@ def index():
             data["msg_ok"] = ok
         return render_template("index.html", **data)
 
+    if action == "update_histogram":
+        ddl = request.form.get("hist_sql") or ""
+        ok, msg = db_utils.run_update_histogram(conn, ddl)
+        data["msg"] = msg
+        data["msg_ok"] = ok
+        if query.strip():
+            data = _fill_analysis(data, conn, query)
+            data["msg"] = msg
+            data["msg_ok"] = ok
+        return render_template("index.html", **data)
+
     # default: analyze query
     if not query.strip():
         data["msg"] = "Paste a query first."
@@ -139,8 +156,14 @@ def _fill_analysis(data, conn, query):
         data["msg_ok"] = False
         return data
 
-    data["issues"] = db_utils.flag_plan_issues(explain.get("rows") or [])
+    data["issues"] = db_utils.flag_plan_issues(
+        explain.get("rows") or [],
+        query_cost=explain.get("query_cost"),
+    )
     data["tips"] = advisor.rewrite_tips(query)
+
+    if data.get("profile_too"):
+        data["profile"] = db_utils.profile_query(conn, query)
 
     schema = (conn.get("database") or "").strip()
     if not schema:
@@ -165,8 +188,31 @@ def _fill_analysis(data, conn, query):
         data["already"] = advice["already"]
         data["used"] = advice["used"]
         data["existing_indexes"] = advice["indexes"]
+        data["tips"] = advisor.rewrite_tips(
+            query,
+            columns_by_table=advice["columns"],
+            tables=advice["tables"],
+        )
+        data["hints"] = advisor.optimizer_hints(
+            query,
+            explain.get("rows") or [],
+            advice["suggestions"],
+            already=advice["already"],
+            tables=advice["tables"],
+        )
         data["stats"] = db_utils.fetch_table_stats(cur, schema, uniq)
-        data["stat_notes"] = db_utils.stats_notes(data["stats"])
+        data["histograms"] = db_utils.fetch_histograms(cur, schema, uniq)
+        data["stat_notes"] = db_utils.stats_notes(
+            data["stats"],
+            used_by_table=advice["used"],
+            histograms=data["histograms"],
+            columns_by_table=advice["columns"],
+        )
+        data["hist_actions"] = db_utils.histogram_actions(
+            advice["used"],
+            data["histograms"],
+            columns_by_table=advice["columns"],
+        )
         session["last_suggestions"] = advice["suggestions"]
         cur.close()
     except Exception as e:

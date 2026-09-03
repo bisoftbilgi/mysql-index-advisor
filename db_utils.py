@@ -1,6 +1,10 @@
-# connection + EXPLAIN + table stats
+# connection + EXPLAIN + table stats + profiling
 
 import json
+import re
+import time
+from datetime import datetime, timedelta
+
 import mysql.connector
 from mysql.connector import Error
 
@@ -61,6 +65,7 @@ def run_explain(info, sql, analyze=False):
         "columns": [],
         "json_text": "",
         "analyze_text": "",
+        "query_cost": None,
         "error": None,
         "analyze_error": None,
     }
@@ -97,7 +102,9 @@ def run_explain(info, sql, analyze=False):
             if jrow:
                 raw = jrow[0]
                 try:
-                    out["json_text"] = json.dumps(json.loads(raw), indent=2)
+                    parsed = json.loads(raw)
+                    out["json_text"] = json.dumps(parsed, indent=2)
+                    out["query_cost"] = extract_query_cost(parsed)
                 except (TypeError, json.JSONDecodeError):
                     out["json_text"] = str(raw)
         except Error:
@@ -111,7 +118,7 @@ def run_explain(info, sql, analyze=False):
                 cur.execute("EXPLAIN ANALYZE " + sql)
                 lines = []
                 for r in cur.fetchall() or []:
-                    lines.append(str(r[0]))
+                    lines.append(str(r[0]) if r else "")
                 out["analyze_text"] = "\n".join(lines)
             except Error as e:
                 out["analyze_error"] = (
@@ -128,7 +135,25 @@ def run_explain(info, sql, analyze=False):
             conn.close()
 
 
-def flag_plan_issues(explain_rows):
+def extract_query_cost(obj):
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            ci = node.get("cost_info") or {}
+            if "query_cost" in ci:
+                found.append(str(ci["query_cost"]))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(obj)
+    return found[0] if found else None
+
+
+def flag_plan_issues(explain_rows, query_cost=None):
     issues = []
     for row in explain_rows:
         table = row.get("table") or "?"
@@ -182,6 +207,20 @@ def flag_plan_issues(explain_rows):
                 "level": "medium",
                 "text": f"`{table}`: Using filesort. An index matching ORDER BY can avoid this.",
             })
+        try:
+            n = int(float(est_rows or 0))
+        except (TypeError, ValueError):
+            n = 0
+        if n >= 5000 and access in ("all", "index"):
+            issues.append({
+                "level": "high",
+                "text": f"`{table}`: optimizer expects to examine ~{n} rows. That is a lot for this access type.",
+            })
+    if query_cost:
+        issues.append({
+            "level": "info",
+            "text": f"Estimated query cost from EXPLAIN JSON: {query_cost} (lower is cheaper; compare before/after an index).",
+        })
     return issues
 
 
@@ -294,36 +333,257 @@ def fetch_table_stats(cur, schema, tables):
     return rows
 
 
-def stats_notes(stat_rows):
+def fetch_histograms(cur, schema, tables):
+    """columns that already have a histogram (MySQL 8 COLUMN_STATISTICS)."""
+    found = []
+    if not tables:
+        return found
+    fmt = ",".join(["%s"] * len(tables))
+    try:
+        cur.execute(
+            f"""
+            SELECT TABLE_NAME, COLUMN_NAME, HISTOGRAM
+            FROM information_schema.COLUMN_STATISTICS
+            WHERE SCHEMA_NAME = %s AND TABLE_NAME IN ({fmt})
+            """,
+            [schema] + list(tables),
+        )
+        for table, col, hist in cur.fetchall():
+            buckets = None
+            if hist:
+                try:
+                    if isinstance(hist, str):
+                        hist = json.loads(hist)
+                    buckets = hist.get("number-of-buckets-specified")
+                except (TypeError, AttributeError, json.JSONDecodeError):
+                    buckets = None
+            found.append({
+                "table": table,
+                "column": col,
+                "buckets": buckets,
+            })
+    except Error:
+        found = []
+    return found
+
+
+def _as_datetime(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def stats_notes(stat_rows, used_by_table=None, histograms=None, columns_by_table=None):
     notes = []
+    hist_set = set()
+    for h in histograms or []:
+        hist_set.add((h["table"].lower(), h["column"].lower()))
+    pk = set()
+    for t, cols in (columns_by_table or {}).items():
+        for c in cols:
+            if (c.get("column_key") or "").upper() == "PRI":
+                pk.add((t.lower(), c["name"].lower()))
+
     for s in stat_rows:
         name = s["table"]
-        if (s.get("table_rows") in (None, 0)) and (s.get("data_length") or 0) > 0:
+        est = s.get("table_rows")
+        innodb = s.get("innodb_n_rows")
+        if (est in (None, 0)) and (s.get("data_length") or 0) > 0:
             notes.append({
                 "level": "high",
                 "text": (
-                    f"`{name}`: information_schema.TABLE_ROWS is 0/NULL but the table has data. "
-                    "Stats look missing or stale — try ANALYZE TABLE."
+                    f"`{name}`: TABLE_ROWS is 0/NULL but the table has data. "
+                    "Table stats look missing — run ANALYZE TABLE."
                 ),
                 "table": name,
             })
+        if est not in (None, 0) and innodb not in (None, 0):
+            try:
+                a, b = float(est), float(innodb)
+                bigger, smaller = max(a, b), min(a, b)
+                if smaller > 0 and (bigger / smaller) >= 1.5:
+                    notes.append({
+                        "level": "high",
+                        "text": (
+                            f"`{name}`: TABLE_ROWS={est} vs innodb n_rows={innodb}. "
+                            "Those estimates disagree a lot — stale stats can trick the optimizer. "
+                            "Run ANALYZE TABLE."
+                        ),
+                        "table": name,
+                    })
+            except (TypeError, ValueError):
+                pass
         if s.get("engine") == "InnoDB":
             notes.append({
                 "level": "info",
                 "text": (
-                    f"`{name}`: InnoDB TABLE_ROWS ({s.get('table_rows')}) is an estimate. "
-                    "If the plan looks weird after big inserts/deletes, run ANALYZE TABLE."
+                    f"`{name}`: InnoDB TABLE_ROWS ({est}) is an estimate, not a count(*). "
+                    "Bad estimates change join order and index choice."
                 ),
                 "table": name,
             })
-        last = s.get("stats_last_update")
+        last = _as_datetime(s.get("stats_last_update"))
         if last is not None:
-            notes.append({
-                "level": "info",
-                "text": f"`{name}`: innodb_table_stats last_update = {last}",
-                "table": name,
-            })
+            age = datetime.now() - last
+            if age >= timedelta(days=7):
+                notes.append({
+                    "level": "high",
+                    "text": (
+                        f"`{name}`: innodb_table_stats last_update is {last} "
+                        f"({age.days} days ago). Treat as stale; run ANALYZE TABLE."
+                    ),
+                    "table": name,
+                })
+            else:
+                notes.append({
+                    "level": "info",
+                    "text": f"`{name}`: innodb_table_stats last_update = {last}",
+                    "table": name,
+                })
+
+    for table, cols in (used_by_table or {}).items():
+        for col in cols:
+            if (table.lower(), col.lower()) in pk:
+                continue
+            if (table.lower(), col.lower()) not in hist_set:
+                notes.append({
+                    "level": "medium",
+                    "text": (
+                        f"`{table}.{col}` is used in the query but has no column histogram. "
+                        "Without it MySQL guesses selectivity. "
+                        f"ANALYZE TABLE `{table}` UPDATE HISTOGRAM ON `{col}` WITH 32 BUCKETS;"
+                    ),
+                    "table": table,
+                    "column": col,
+                })
     return notes
+
+
+def histogram_actions(used_by_table, histograms, columns_by_table=None):
+    hist_set = set()
+    for h in histograms or []:
+        hist_set.add((h["table"].lower(), h["column"].lower()))
+    pk = set()
+    for t, cols in (columns_by_table or {}).items():
+        for c in cols:
+            if (c.get("column_key") or "").upper() == "PRI":
+                pk.add((t.lower(), c["name"].lower()))
+    actions = []
+    seen = set()
+    for table, cols in (used_by_table or {}).items():
+        for col in cols:
+            key = (table.lower(), col.lower())
+            if key in hist_set or key in seen or key in pk:
+                continue
+            seen.add(key)
+            sql = (
+                f"ANALYZE TABLE `{table}` UPDATE HISTOGRAM ON `{col}` WITH 32 BUCKETS"
+            )
+            actions.append({
+                "table": table,
+                "column": col,
+                "sql": sql,
+                "label": f"{table}.{col}",
+            })
+    return actions
+
+
+def run_update_histogram(info, ddl):
+    ddl = (ddl or "").strip().rstrip(";")
+    upper = ddl.upper()
+    if not upper.startswith("ANALYZE TABLE") or "HISTOGRAM" not in upper:
+        return False, "Only ANALYZE TABLE ... UPDATE HISTOGRAM is allowed here."
+    if ";" in ddl:
+        return False, "One statement only."
+    conn = None
+    try:
+        conn = connect(info)
+        cur = conn.cursor()
+        cur.execute(ddl)
+        rows = cur.fetchall()
+        conn.commit()
+        cur.close()
+        msg = "; ".join(" | ".join(str(x) for x in r) for r in rows)
+        return True, msg or "Histogram updated."
+    except Error as e:
+        return False, str(e)
+    finally:
+        if conn is not None and conn.is_connected():
+            conn.close()
+
+
+def profile_query(info, sql):
+    """
+    Execute a SELECT and record wall time + SHOW PROFILE steps if the server allows it.
+    """
+    sql = _strip_sql(sql)
+    out = {
+        "ok": False,
+        "error": None,
+        "duration_ms": None,
+        "rowcount": None,
+        "steps": [],
+        "profiling_note": "",
+    }
+    if not sql:
+        out["error"] = "No query given."
+        return out
+    if looks_like_multi_statement(sql):
+        out["error"] = "One statement only."
+        return out
+    if not re.match(r"\s*SELECT\b", sql, re.I):
+        out["error"] = "Profiling only runs SELECT (it executes the query)."
+        return out
+
+    conn = None
+    try:
+        conn = connect(info)
+        cur = conn.cursor()
+        used_show_profile = False
+        try:
+            cur.execute("SET profiling_history_size = 15")
+            cur.execute("SET profiling = 1")
+            used_show_profile = True
+        except Error:
+            used_show_profile = False
+
+        t0 = time.perf_counter()
+        cur.execute(sql)
+        rows = cur.fetchall()
+        out["duration_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        out["rowcount"] = len(rows)
+
+        if used_show_profile:
+            try:
+                cur.execute("SHOW PROFILE")
+                steps = []
+                for r in cur.fetchall() or []:
+                    steps.append({"status": r[0], "duration": r[1]})
+                out["steps"] = steps
+            except Error as e:
+                out["profiling_note"] = "SHOW PROFILE not available: " + str(e)
+        else:
+            out["profiling_note"] = (
+                "Server refused SET profiling=1 (common on MySQL 8). "
+                "Wall-clock time above is still real execution time."
+            )
+        out["ok"] = True
+        cur.close()
+        return out
+    except Error as e:
+        out["error"] = str(e)
+        return out
+    finally:
+        if conn is not None and conn.is_connected():
+            conn.close()
 
 
 def run_analyze_table(info, table):

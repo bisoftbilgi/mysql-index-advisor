@@ -26,23 +26,16 @@ Open http://127.0.0.1:5000
 ## What it does right now
 
 - Connection form + test
-- `EXPLAIN` (optional `EXPLAIN ANALYZE` checkbox — that one runs the query)
-- Marks ALL / filesort / temp table / unused possible keys
-- Index suggestions from WHERE / JOIN / ORDER BY, compared with `information_schema.STATISTICS`
-- Menu to create one selected index
-- Table stats + optional `ANALYZE TABLE`
-- Simple rewrite notes: SELECT *, YEAR(col), LIKE '%x', OR, NOT IN, ORDER BY RAND()
+- Execution plan: `EXPLAIN`, estimated JSON cost, flags for ALL / filesort / temp table / unused keys; optional `EXPLAIN ANALYZE`
+- Query profile: optional execute SELECT, wall time + `SHOW PROFILE` when the server allows it
+- Index suggestions (hypothetical until you create one from the menu)
+- Table stats + stale/missing checks; column histograms; optional `ANALYZE TABLE` / `UPDATE HISTOGRAM`
+- Rewrites with copy-paste SQL (SELECT *, YEAR(col), ...) and FORCE INDEX hints
 
 ## Files
 
 - `app.py` — Flask routes
-- `db_utils.py` — connection, EXPLAIN, stats
-- `advisor.py` — parse query, suggest indexes, rewrite tips
+- `db_utils.py` — connection, EXPLAIN, stats, profiling
+- `advisor.py` — parse query, suggest indexes, rewrites, hints
 - `schema.sql` / `seed_demo.py` — demo data
 - `sample_queries.sql` — same examples as the dropdown
-
-## Next (later weeks)
-
-- Better subquery handling
-- Maybe slow query log
-- A couple more rewrite rules / hints

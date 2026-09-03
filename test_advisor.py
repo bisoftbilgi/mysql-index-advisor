@@ -55,5 +55,31 @@ sug, already = advisor.build_index_suggestions(
     cols,
 )
 assert sug and sug[0]["columns"] == ["status"]
+
+year_q = "SELECT order_id FROM orders WHERE YEAR(order_date) = 2024"
+year_used = advisor.collect_used_columns(
+    year_q,
+    [("orders", "orders")],
+    cols,
+)
+assert "order_date" in year_used.get("orders", {})
+year_rw = advisor.rewrite_year_predicate(year_q)
+assert year_rw and "2024-01-01" in year_rw and "2025-01-01" in year_rw
+assert "YEAR" not in year_rw.upper() or "YEAR(" not in year_rw.upper()
+
+star_rw = advisor.expand_select_star(
+    q,
+    [("orders", "orders")],
+    cols,
+)
+assert star_rw and "FROM" in star_rw.upper()
+assert "*" not in star_rw.split("FROM")[0]
+assert "status" in star_rw
+
+hinted = advisor.inject_index_hint(q, "orders", "idx_orders_status")
+assert hinted and "FORCE INDEX" in hinted and "WHERE" in hinted.upper()
+
 print("parser checks ok")
 print("suggestion:", sug[0]["sql"])
+print("year rewrite:", year_rw)
+print("hint:", hinted)

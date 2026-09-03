@@ -120,6 +120,15 @@ def classify_column_use(section, col_patterns, kind_hint=None):
             if kind == "skip":
                 continue
             used.setdefault(real, set()).add(kind)
+        wrap = re.search(
+            r"\b(?:YEAR|MONTH|DAY|DATE|HOUR|LOWER|UPPER|TRIM|SUBSTRING|CONVERT)\s*\(\s*"
+            + re.escape(text)
+            + r"\s*\)",
+            section,
+            re.I,
+        )
+        if wrap:
+            used.setdefault(real, set()).add("range")
         if kind_hint:
             # ORDER BY / GROUP BY: column listed without needing an operator
             bare = re.search(r"(?<![\w.])" + re.escape(text) + r"(?![\w.])", section, re.I)
@@ -256,14 +265,158 @@ def build_index_suggestions(used_by_table, indexes_by_table, columns_by_table):
             "sql": ddl,
             "label": f"{real_table} ({', '.join(suggested_cols)})",
             "why": "; ".join(why) if why else "used in the query",
+            "hypothetical": True,
         })
     return suggestions, already
 
 
-def rewrite_tips(sql):
+def _table_cols(columns_by_table, table):
+    if not columns_by_table:
+        return []
+    if table in columns_by_table:
+        return columns_by_table[table]
+    for k, v in columns_by_table.items():
+        if k.lower() == table.lower():
+            return v
+    return []
+
+
+def expand_select_star(sql, tables, columns_by_table):
+    sql_s = _strip(sql)
+    if not re.search(r"\bSELECT\s+\*", sql_s, re.I):
+        return None
+    if not tables or not columns_by_table:
+        return None
+    pieces = []
+    for table, alias in tables:
+        cols = _table_cols(columns_by_table, table)
+        if not cols:
+            continue
+        qualify = alias
+        for c in cols:
+            pieces.append(f"`{qualify}`.`{c['name']}`")
+    if not pieces:
+        return None
+    return re.sub(r"\bSELECT\s+\*", "SELECT " + ", ".join(pieces), sql_s, count=1, flags=re.I)
+
+
+def rewrite_year_predicate(sql):
+    sql_s = _strip(sql)
+
+    def repl(m):
+        col = m.group(1)
+        year = int(m.group(2))
+        return f"{col} >= '{year}-01-01' AND {col} < '{year + 1}-01-01'"
+
+    new, n = re.subn(
+        r"YEAR\s*\(\s*`?([A-Za-z_][\w]*)`?\s*\)\s*=\s*(\d{4})",
+        repl,
+        sql_s,
+        flags=re.I,
+    )
+    return new if n else None
+
+
+def rewrite_lower_eq(sql):
+    sql_s = _strip(sql)
+
+    def repl(m):
+        col = m.group(1)
+        lit = m.group(2)
+        return f"{col} = {lit}"
+
+    new, n = re.subn(
+        r"(?:LOWER|UPPER)\s*\(\s*`?([A-Za-z_][\w]*)`?\s*\)\s*=\s*(['\"][^'\"]*['\"])",
+        repl,
+        sql_s,
+        flags=re.I,
+    )
+    return new if n else None
+
+
+def inject_index_hint(sql, table, index_name):
+    sql_s = _strip(sql)
+    pat = (
+        r"(\b(?:FROM|JOIN)\s+)`?" + re.escape(table) + r"`?"
+        r"(?:\s+(?:AS\s+)?"
+        r"(?!(?:WHERE|JOIN|INNER|LEFT|RIGHT|ON|GROUP|ORDER|LIMIT|HAVING|SET|UNION|FORCE|USE|IGNORE)\b)"
+        r"`?([A-Za-z_][\w]*)`?)?"
+    )
+
+    def repl(m):
+        alias = m.group(2)
+        if alias:
+            return f"{m.group(1)}`{table}` {alias} FORCE INDEX (`{index_name}`)"
+        return f"{m.group(1)}`{table}` FORCE INDEX (`{index_name}`)"
+
+    new, n = re.subn(pat, repl, sql_s, count=1, flags=re.I)
+    return new if n else None
+
+
+def optimizer_hints(sql, explain_rows, suggestions, already=None, tables=None):
+    hints = []
+    seen = set()
+
+    def real_table(name):
+        n = (name or "").strip()
+        for table, alias in tables or []:
+            if n.lower() == table.lower() or n.lower() == alias.lower():
+                return table
+        return n
+
+    for row in explain_rows or []:
+        possible = str(row.get("possible_keys") or "").strip()
+        key = str(row.get("key") or "").strip()
+        table = real_table(str(row.get("table") or "").strip())
+        if possible and not key and table:
+            first_idx = possible.split(",")[0].strip()
+            hinted = inject_index_hint(sql, table, first_idx)
+            sig = ("force", table, first_idx)
+            if hinted and sig not in seen:
+                seen.add(sig)
+                hints.append({
+                    "title": f"FORCE INDEX on `{table}`",
+                    "detail": (
+                        f"EXPLAIN has possible_keys={possible} but key is empty. "
+                        f"This hint asks the optimizer to use `{first_idx}`. "
+                        "Only keep it if EXPLAIN gets better; hints can also make things worse."
+                    ),
+                    "sql": hinted,
+                })
+    for a in already or []:
+        name = a.get("index_name")
+        table = a.get("table")
+        if not name or name.upper() == "PRIMARY":
+            continue
+        hinted = inject_index_hint(sql, table, name)
+        sig = ("use-existing", table, name)
+        if hinted and sig not in seen:
+            seen.add(sig)
+            hints.append({
+                "title": f"USE / FORCE INDEX `{name}`",
+                "detail": f"`{table}` already has `{name}`. If the plan ignores it, this hint can force a lookup.",
+                "sql": hinted,
+            })
+    for s in suggestions or []:
+        hinted = inject_index_hint(sql, s["table"], s["index_name"])
+        if not hinted:
+            continue
+        hints.append({
+            "title": f"Hypothetical: after `{s['index_name']}` exists",
+            "detail": (
+                "MySQL cannot test an index that is not created yet. "
+                "This is the same query with FORCE INDEX, for after you create it from the menu."
+            ),
+            "sql": hinted,
+        })
+    return hints
+
+
+def rewrite_tips(sql, columns_by_table=None, tables=None):
     sql_s = _strip(sql)
     tips = []
 
+    star_sql = expand_select_star(sql_s, tables or [], columns_by_table or {})
     if re.search(r"\bSELECT\s+\*", sql_s, re.I):
         tips.append({
             "title": "SELECT *",
@@ -271,9 +424,10 @@ def rewrite_tips(sql):
                 "Pulling every column makes the row wider than you need. "
                 "It can also stop covering indexes from being used. List only the columns you use."
             ),
-            "rewrite": None,
+            "rewrite": star_sql,
         })
 
+    year_sql = rewrite_year_predicate(sql_s)
     for m in re.finditer(
         r"\b(YEAR|MONTH|DAY|DATE|HOUR|LOWER|UPPER|TRIM|SUBSTRING|CONVERT)\s*\(\s*`?([A-Za-z_][\w]*)`?",
         sql_s,
@@ -282,11 +436,15 @@ def rewrite_tips(sql):
         fn = m.group(1).upper()
         col = m.group(2)
         extra = ""
+        rewrite = None
         if fn == "YEAR":
             extra = (
-                f" Example: `{col} >= '2024-01-01' AND {col} < '2025-01-01'` "
-                "instead of YEAR(col) = 2024."
+                f" Rewrite YEAR({col}) = 2024 as a range so an index on {col} can be used."
             )
+            rewrite = year_sql
+        elif fn in ("LOWER", "UPPER"):
+            rewrite = rewrite_lower_eq(sql_s)
+            extra = " Compare the column directly if collation already handles case."
         tips.append({
             "title": f"Function on column ({fn}({col}))",
             "detail": (
@@ -294,7 +452,7 @@ def rewrite_tips(sql):
                 "Apply functions to the constant side if you can."
                 + extra
             ),
-            "rewrite": None,
+            "rewrite": rewrite,
         })
 
     if re.search(r"LIKE\s+'%", sql_s, re.I) or re.search(r'LIKE\s+"%', sql_s, re.I):
@@ -324,7 +482,6 @@ def rewrite_tips(sql):
             "rewrite": None,
         })
 
-    # OR across different columns is a common index killer
     where = cut_section(sql_s, "WHERE", ["GROUP", "ORDER", "LIMIT", "HAVING", "UNION", "FOR"])
     if where and re.search(r"\bOR\b", where, re.I):
         tips.append({
@@ -339,11 +496,13 @@ def rewrite_tips(sql):
     if re.search(r"\bNOT\s+IN\s*\(", sql_s, re.I):
         tips.append({
             "title": "NOT IN (...)",
-            "detail": "NOT IN with a subquery is often slower than NOT EXISTS / LEFT JOIN ... IS NULL. Also watch for NULLs.",
+            "detail": (
+                "NOT IN with a subquery is often slower than NOT EXISTS / LEFT JOIN ... IS NULL. "
+                "Also watch for NULLs."
+            ),
             "rewrite": None,
         })
 
-    # implicit string vs numeric is hard to detect without types; skip for now
     return tips
 
 
