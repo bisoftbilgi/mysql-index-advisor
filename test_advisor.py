@@ -76,6 +76,7 @@ assert star_rw and "FROM" in star_rw.upper()
 assert "*" not in star_rw.split("FROM")[0]
 assert "status" in star_rw
 
+
 hinted = advisor.inject_index_hint(q, "orders", "idx_orders_status")
 assert hinted and "FORCE INDEX" in hinted and "WHERE" in hinted.upper()
 

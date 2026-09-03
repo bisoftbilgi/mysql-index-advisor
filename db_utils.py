@@ -135,6 +135,7 @@ def run_explain(info, sql, analyze=False):
             conn.close()
 
 
+
 def extract_query_cost(obj):
     found = []
 

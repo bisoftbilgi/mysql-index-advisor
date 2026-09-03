@@ -3,6 +3,7 @@ import mysql.connector
 from mysql.connector import Error
 from datetime import datetime
 
+
 def fetch_sample_value(connection, table, column):
     """Fetches a sample value from a given table and column."""
     try:

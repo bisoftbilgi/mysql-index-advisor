@@ -227,3 +227,4 @@ def _fill_analysis(data, conn, query):
 if __name__ == "__main__":
     # debug on so template edits show up while I work
     app.run(debug=True)
+

@@ -32,6 +32,7 @@ Open http://127.0.0.1:5000
 - Table stats + stale/missing checks; column histograms; optional `ANALYZE TABLE` / `UPDATE HISTOGRAM`
 - Rewrites with copy-paste SQL (SELECT *, YEAR(col), ...) and FORCE INDEX hints
 
+
 ## Files
 
 - `app.py` — Flask routes

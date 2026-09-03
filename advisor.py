@@ -270,6 +270,7 @@ def build_index_suggestions(used_by_table, indexes_by_table, columns_by_table):
     return suggestions, already
 
 
+
 def _table_cols(columns_by_table, table):
     if not columns_by_table:
         return []

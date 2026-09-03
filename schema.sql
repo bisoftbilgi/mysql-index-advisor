@@ -21,6 +21,7 @@ CREATE TABLE customers (
   PRIMARY KEY (customer_id)
 ) ENGINE=InnoDB;
 
+
 CREATE TABLE products (
   product_id INT NOT NULL AUTO_INCREMENT,
   sku VARCHAR(40) NOT NULL,

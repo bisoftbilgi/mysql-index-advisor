@@ -24,3 +24,4 @@ FROM customers c
 JOIN orders o ON o.customer_id = c.customer_id
 WHERE c.city = 'Ankara'
 GROUP BY c.city;
+
